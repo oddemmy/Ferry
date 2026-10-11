@@ -14,9 +14,6 @@ const validPassword = (p) => typeof p === "string" && p.length >= 8;
 const signToken = (user) =>
     jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: "1h" });
 
-// Signed with the current password hash mixed in, so a reset token stops working the moment the password changes
-const resetSecret = (user) => process.env.JWT_SECRET + user.password_hash;
-
 const findUser = async (email) => {
     const result = await pool.query("SELECT * FROM users WHERE lower(email) = $1", [email]);
     return result.rows[0];
@@ -150,7 +147,7 @@ router.post("/verify-reset-code", async (req, res, next) => {
 
         const resetToken = jwt.sign(
             { userId: user.id, purpose: "password-reset" },
-            resetSecret(user),
+            process.env.JWT_SECRET,
             { expiresIn: "10m" }
         );
         return res.status(200).json({ resetToken });
@@ -162,7 +159,7 @@ router.post("/verify-reset-code", async (req, res, next) => {
 // POST /auth/reset-password  { resetToken, newPassword }
 router.post("/reset-password", async (req, res, next) => {
     const { resetToken, newPassword } = req.body || {};
-    if (typeof resetToken !== "string" || !resetToken) {
+    if (!resetToken) {
         return res.status(400).json({ error: "Reset session missing. Please start again." });
     }
     if (!validPassword(newPassword)) {
@@ -170,30 +167,23 @@ router.post("/reset-password", async (req, res, next) => {
     }
     const expired = { error: "Reset session expired. Please start again." };
     try {
-        const decoded = jwt.decode(resetToken);
-        if (!decoded?.userId || decoded.purpose !== "password-reset") {
+        let decoded;
+        try {
+            decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+        } catch {
             return res.status(400).json(expired);
         }
-        const result = await pool.query("SELECT * FROM users WHERE id = $1", [decoded.userId]);
-        const user = result.rows[0];
-        if (!user) return res.status(400).json(expired);
-
-        try {
-            jwt.verify(resetToken, resetSecret(user), { algorithms: ["HS256"] });
-        } catch {
+        if (decoded.purpose !== "password-reset") {
             return res.status(400).json(expired);
         }
 
         const hashed = await bcrypt.hash(newPassword, 10);
-        // They proved they own the inbox, so mark the email verified too
         await pool.query(
             "UPDATE users SET password_hash = $1, email_verified = TRUE WHERE id = $2",
-            [hashed, user.id]
+            [hashed, decoded.userId]
         );
-        await pool.query("DELETE FROM email_codes WHERE user_id = $1", [user.id]);
         return res.status(200).json({ message: "Password updated. You can now log in." });
     } catch (error) {
-        if (error.code === "22P02") return res.status(400).json(expired);
         next(error);
     }
 });
